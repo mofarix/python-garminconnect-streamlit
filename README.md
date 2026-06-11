@@ -6,6 +6,65 @@
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)](https://www.paypal.me/cyberjunkynl/)
 [![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-red.svg?style=for-the-badge&logo=github)](https://github.com/sponsors/cyberjunky)
 
+# Python: Garmin Connect — Analysis Fork
+
+> **Fork von [cyberjunky/python-garminconnect](https://github.com/cyberjunky/python-garminconnect/releases)**
+>
+> Ein riesiges Dankeschön an **[@cyberjunky](https://github.com/cyberjunky)** für die brillante Arbeit an der
+> ursprünglichen Bibliothek. Der saubere API-Wrapper, das durchdachte Token-Management und die
+> konsequente Pflege über Jahre sind beeindruckend — ohne dieses Fundament wäre dieses Projekt
+> nicht möglich. Bitte unterstützt cyberjunky direkt:
+> [GitHub Sponsors](https://github.com/sponsors/cyberjunky) · [PayPal](https://www.paypal.me/cyberjunkynl/)
+
+## Analyse-Skripte in diesem Fork
+
+Neben der Garmin-Connect-API-Bibliothek enthält dieser Fork drei Analyse-Skripte:
+
+### `10_pipeline.py` — Garmin-Export-Pipeline
+
+Lädt automatisch GPX- und FIT-Dateien der letzten N Aktivitäten aus Garmin Connect herunter
+und speichert sie lokal unter `garmin_export/`.
+
+- Login mit Token-Persistenz (kein erneutes Eingeben von Passwort nötig)
+- Unterstützt MFA
+- Filtert GPS-Aktivitäten und extrahiert FIT-Dateien aus dem Original-ZIP
+- Konfigurierbar über Umgebungsvariablen (`GARMIN_EMAIL`, `GARMIN_PASSWORD`, `GARMIN_ACTIVITY_LIMIT`)
+
+```bash
+python 10_pipeline.py
+```
+
+### `00_app.py` — GPX-Analyse-Bibliothek
+
+Berechnungs- und Visualisierungsfunktionen für die GPX-Analyse — enthält keine UI, wird als
+Hilfsbibliothek importiert.
+
+- **Kalman-Filter (2D)**: GPS-Rauschen glätten, realistische Geschwindigkeit und Beschleunigung ableiten
+- **Höhen- & Steigungsberechnung**: Median-Filter + Savitzky-Golay-Glättung, gleichmäßiges Resampling
+- **Leistungsmodell**: Rollwiderstand, Luftwiderstand, Steigungskraft, Beschleunigungskraft → Fahrerleistung (W)
+- **Kartenvisualisierung**: Interaktive Folium-Karte mit farbcodierter Geschwindigkeitsspur
+- **Statistiken**: Distanz, Dauer, Höhenmeter, Spitzengeschwindigkeit, Durchschnittsleistung
+
+### `20_cycling_dashboard.py` — Cycling-Dashboard
+
+Erzeugt ein eigenständiges HTML-Dashboard aus den FIT-Dateien in `garmin_export/fit/`.
+
+- **Wöchentliches Volumen**: Gestapeltes Balkendiagramm nach Fahrttyp (Pendeln, Training, Regeneration …)
+- **Fitness-Trend**: Herzfrequenz-Drift und Tempo auf der Pendelstrecke als Kontrollroute
+- **Aktivitäts-Kalender**: GitHub-style Heatmap der täglichen Kilometer
+- **HF-Zonen**: Monatliche Zonenverteilung (Z1–Z5)
+- **Distanz-Histogramm**: Verteilung der Fahrtlängen nach Typ
+- **Pendel-Quote**: Monatlicher Anteil der Pendel-Fahrten an Werktagen
+- **KPI-Kacheln**: Fahrten, Distanz, Fahrzeit, Ø Tempo, Ø HF, Höhenmeter auf einen Blick
+- **Fahrt-Tabelle**: Letzte 15 Fahrten mit Datum, Typ, km, min, km/h, HF, hm
+
+```bash
+python 10_pipeline.py          # Daten herunterladen
+python 20_cycling_dashboard.py # Dashboard erzeugen → .output/cycling_dashboard_real.html
+```
+
+---
+
 # Python: Garmin Connect
 
 The Garmin Connect API library comes with two examples:
@@ -345,6 +404,23 @@ client.unschedule_workout(scheduled_workout_id)
 - **Test Cases**: Real-world usage examples in `tests/` directory
 
 ## 🙏 Acknowledgments
+
+### Upstream Project
+
+This fork is built on the outstanding work of **[cyberjunky](https://github.com/cyberjunky)**.
+A huge thank you for creating and maintaining the original
+**[cyberjunky/python-garminconnect](https://github.com/cyberjunky/python-garminconnect/releases)** —
+one of the most complete and well-maintained open-source Garmin Connect integrations available.
+The resilient multi-strategy login, thorough API coverage (134+ endpoints), typed workout models,
+and years of careful maintenance are a remarkable achievement.
+Without that foundation, none of this analysis fork would exist.
+
+Please consider supporting cyberjunky directly:
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)](https://www.paypal.me/cyberjunkynl/)
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-red.svg?style=for-the-badge&logo=github)](https://github.com/sponsors/cyberjunky)
+
+### Community Contributors
 
 Special thanks to all contributors who have helped improve this project:
 
