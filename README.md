@@ -55,9 +55,6 @@ und speichert sie lokal unter `garmin_export/`.
 - Filtert GPS-Aktivitäten und extrahiert FIT-Dateien aus dem Original-ZIP
 - Konfigurierbar über Umgebungsvariablen (`GARMIN_EMAIL`, `GARMIN_PASSWORD`, `GARMIN_ACTIVITY_LIMIT`)
 
-```bash
-python pipeline.py
-```
 
 ### `dashboard.py` — Cycling-Dashboard-Modul
 
@@ -73,9 +70,6 @@ Wird von `app.py` als Modul geladen; kann auch standalone ein HTML-Dashboard erz
 - **KPI-Kacheln**: Fahrten, Distanz, Fahrzeit, Ø Tempo, Ø HF, Höhenmeter auf einen Blick
 - **Fahrt-Tabelle**: Letzte 15 Fahrten mit Datum, Typ, km, min, km/h, HF, hm
 
-```bash
-python dashboard.py  # → .output/cycling_dashboard_real.html
-```
 
 ### `app.py` — Streamlit-App
 
