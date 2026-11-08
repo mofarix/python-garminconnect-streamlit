@@ -341,8 +341,8 @@ elif page == "Cycling Dashboard":
         ("Ø Tempo",        _fmt(k["avg_speed"]),          "km/h",              None),
         ("Ø Herzfrequenz", _fmt(k["avg_hr"], 0),          "bpm",               None),
         ("Höhenmeter",     f"{int(k['elevation']):,}",   "hm",
-         f"Gefiltert: nur Gewinne > {dash.ELEV_GAIN_THRESHOLD_M:.0f} m pro Trackpunkt gezählt "
-         f"(Gerätewert total_ascent überschätzt durch GPS-Rauschen)."),
+         "Aus Trackpunkten berechnet: Median- und Savitzky-Golay-Glättung, dann Anstiege summiert "
+         "(Gerätewert total_ascent überschätzt durch GPS-Rauschen)."),
         ("Pendel-Quote",   _fmt(k["commute_pct"], 0),    "% der Werktage",    None),
         ("Wochen aktiv",   str(k["n_weeks"]),             "Wochen",            None),
     ]

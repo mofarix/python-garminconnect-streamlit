@@ -21,19 +21,19 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 
+from gpx_analysis import total_ascent_m
+
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
 FIT_DIR    = Path("./garminexports/standard/fit")
 DATE_FROM  = pd.Timestamp("2024-01-01")   # alles ab hier einlesen
 
-# Höhenmeter-Filter: Garmin summiert in total_ascent jeden GPS-Jitter mit.
-# Stattdessen lesen wir die rohen Altitude-Trackpunkte und zählen nur
-# Gewinne > ELEV_GAIN_THRESHOLD_M — das eliminiert hochfrequentes Rauschen.
-ELEV_GAIN_THRESHOLD_M = 2.0
-
+# Höhenmeter: Garmin summiert in total_ascent jeden GPS-Jitter mit. Stattdessen
+# werden die rohen Altitude-Trackpunkte mit Median- + Savitzky-Golay-Filter
+# geglättet (gpx_analysis.total_ascent_m) und erst dann die Anstiege summiert.
 # Cache-Version: bei Änderungen an der Parse-Logik erhöhen → automatische Re-Parse.
-CACHE_VERSION = "v2-elev-filtered"
+CACHE_VERSION = "v3-elev-savgol"
 
 # Klassifikations-Schwellen (identisch mit 33_)
 KURZ_MAX_KM   = 7
@@ -110,15 +110,8 @@ def _read_fit_session(fit_path: Path) -> dict | None:
         if not session:
             return None
 
-        # Gefilterte Höhenmeter aus Trackpunkten (s. ELEV_GAIN_THRESHOLD_M)
-        if len(altitudes) >= 2:
-            session["elevation"] = int(sum(
-                altitudes[i] - altitudes[i - 1]
-                for i in range(1, len(altitudes))
-                if altitudes[i] - altitudes[i - 1] > ELEV_GAIN_THRESHOLD_M
-            ))
-        else:
-            session["elevation"] = 0
+        # Geglättete Höhenmeter aus Trackpunkten (gleiche Methode wie GPX-Analyse)
+        session["elevation"] = int(round(total_ascent_m(altitudes)))
 
         return session
 

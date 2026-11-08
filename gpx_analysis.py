@@ -98,6 +98,20 @@ def smooth_elevation_for_plot(elevation, median_kernel=7, savgol_window=51, poly
     return z_smooth
 
 
+def total_ascent_m(elevation):
+    """Gesamtaufstieg in Metern: Median + Savitzky-Golay glätten, dann positive Differenzen summieren.
+
+    Einzige Quelle für Höhenmeter in Dashboard und GPX-Analyse, damit beide
+    für dieselbe Fahrt denselben Wert liefern.
+    """
+    z = np.asarray(elevation, dtype=float)
+    z = z[~np.isnan(z)]
+    if len(z) < 2:
+        return 0.0
+    diffs = np.diff(smooth_elevation_for_plot(z))
+    return float(diffs[diffs > 0].sum())
+
+
 def load_gpx_data_from_upload(uploaded_file):
     gpx = gpxpy.parse(uploaded_file.getvalue().decode("utf-8"))
     data = []
@@ -502,8 +516,7 @@ def create_speed_map(df):
 # STATISTICS
 # ============================================================
 def get_stats(df):
-    ele_diffs = df["ele_smooth"].diff()
-    total_gain = ele_diffs[ele_diffs > 0].sum()
+    total_gain = total_ascent_m(df["elevation"].to_numpy())
 
     max_speed = df["speed_smooth"].max()
     max_power = df["P_gesamt_fahrer_smooth"].max()
