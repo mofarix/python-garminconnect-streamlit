@@ -23,11 +23,14 @@ import logging
 import threading
 import time
 from contextlib import ExitStack, contextmanager
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import call, patch
 
 import pytest
+from requests import Response, Session
+from requests.cookies import create_cookie
 
 import garminconnect
 from garminconnect import client as client_mod
@@ -244,7 +247,13 @@ class TestUrlConstruction:
     @pytest.mark.parametrize(
         ("start", "end", "sport", "aggregation", "message"),
         [
-            ("2025-06-30", "2025-06-01", "CYCLING", "daily", "start date cannot be after end date"),
+            (
+                "2025-06-30",
+                "2025-06-01",
+                "CYCLING",
+                "daily",
+                "start date cannot be after end date",
+            ),
             ("2025-06-01", "2025-06-30", "cycling/running", "daily", "sport must"),
             ("2025-06-01", "2025-06-30", "CYCLING", "hourly", "aggregation"),
         ],
@@ -449,20 +458,115 @@ class TestUrlConstruction:
         assert "%3F" in encoded
         assert "%23" in encoded
 
-    def test_require_display_name_raises_when_not_set(
+    def test_require_display_name_raises_when_reload_fails(
         self, garmin: garminconnect.Garmin
     ):
         garmin.display_name = None
-        with pytest.raises(
-            garminconnect.GarminConnectConnectionError, match="Display name is not set"
+        with (
+            patch.object(garmin.client, "connectapi", side_effect=Exception("boom")),
+            patch("garminconnect.time.sleep"),
+            pytest.raises(
+                garminconnect.GarminConnectConnectionError, match="social profile"
+            ),
+        ):
+            garmin._require_display_name()
+
+    def test_require_display_name_reloads_profile_when_not_set(
+        self, garmin: garminconnect.Garmin
+    ):
+        garmin.display_name = None
+        with patch.object(
+            garmin.client, "connectapi", return_value={"displayName": "a b"}
+        ):
+            assert garmin._require_display_name() == "a%20b"
+        assert garmin.display_name == "a b"
+
+    def test_load_social_profile_retries_when_display_name_missing(
+        self, garmin: garminconnect.Garmin
+    ):
+        with (
+            patch.object(
+                garmin.client, "connectapi", side_effect=[{}, {"displayName": "x"}]
+            ) as mock,
+            patch("garminconnect.time.sleep"),
+        ):
+            garmin._load_social_profile()
+        assert garmin.display_name == "x"
+        assert garmin.profile_id is None
+        assert mock.call_count == 2
+
+    def test_load_social_profile_falls_back_to_username_after_retries(
+        self, garmin: garminconnect.Garmin
+    ):
+        garmin.display_name = None
+        with (
+            patch.object(
+                garmin.client,
+                "connectapi",
+                side_effect=[{}, {"displayName": 123}, {"displayName": " "}],
+            ) as mock,
+            patch("garminconnect.time.sleep"),
+        ):
+            garmin._load_social_profile()
+        assert garmin.display_name == "test@example.com"
+        assert mock.call_count == 3
+
+    def test_load_social_profile_stores_integer_profile_id(
+        self, garmin: garminconnect.Garmin
+    ):
+        with patch.object(
+            garmin.client,
+            "connectapi",
+            return_value={
+                "displayName": "x",
+                "fullName": "X",
+                "profileId": 99,
+            },
+        ):
+            garmin._load_social_profile()
+        assert garmin.profile_id == 99
+        assert garmin.full_name == "X"
+
+    def test_load_social_profile_raises_without_dict_response(
+        self, garmin: garminconnect.Garmin
+    ):
+        garmin.display_name = None
+        with (
+            patch.object(garmin.client, "connectapi", side_effect=[None, "x", []]),
+            patch("garminconnect.time.sleep"),
+            pytest.raises(garminconnect.GarminConnectAuthenticationError),
+        ):
+            garmin._load_social_profile()
+        assert garmin.display_name is None
+
+    def test_require_display_name_raises_when_profile_has_none(
+        self, garmin: garminconnect.Garmin
+    ):
+        garmin.username = None
+        garmin.display_name = None
+        with (
+            patch.object(garmin.client, "connectapi", return_value={}),
+            patch("garminconnect.time.sleep"),
+            pytest.raises(
+                garminconnect.GarminConnectConnectionError,
+                match="Display name is not set",
+            ),
         ):
             garmin._require_display_name()
 
     @pytest.mark.parametrize(
         "method_name,args,expected_suffix",
         [
-            ("get_heart_rates", ("2026-03-15",), "/wellness-service/wellness/dailyHeartRate"),
-            ("get_sleep_data", ("2026-03-15",), "/wellness-service/wellness/dailySleepData"),
+            (
+                "get_heart_rates",
+                ("2026-03-15",),
+                "/wellness-service/wellness/dailyHeartRate",
+            ),
+            (
+                "get_sleep_data",
+                ("2026-03-15",),
+                "/wellness-service/wellness/dailySleepData",
+            ),
         ],
     )
     def test_display_name_is_url_encoded_in_path(
@@ -587,9 +691,7 @@ class TestCredentialLifecycle:
         assert g.password is None
 
     def test_password_retained_when_login_returns_for_mfa(self):
-        g = garminconnect.Garmin(
-            "user@example.com", "secret", return_on_mfa=True
-        )
+        g = garminconnect.Garmin("user@example.com", "secret", return_on_mfa=True)
         with patch.object(
             g.client, "login", return_value=("mfa_status", "legacy_token")
         ):
@@ -602,6 +704,31 @@ class TestCredentialLifecycle:
 # ---------------------------------------------------------------------------
 # MFA resume_login
 # ---------------------------------------------------------------------------
+
+
+def _widget_mfa_state(impersonate: str | None) -> dict[str, Any]:
+    """Client state as login(return_on_mfa=True) returns it for the widget flow."""
+    return {
+        "domain": "garmin.com",
+        "flow": "widget",
+        "method": "email",
+        "login_params": {"id": "gauth-widget"},
+        "post_headers": {"Referer": "https://sso.garmin.com/sso/signin"},
+        "service_url": None,
+        "csrf_token": "tok123",
+        "impersonate": impersonate,
+        "cookies": [
+            {
+                "name": "SESSIONID",
+                "value": "s1",
+                "domain": "sso.garmin.com",
+                "path": "/sso",
+                "secure": False,
+                "expires": None,
+                "domain_specified": True,
+            }
+        ],
+    }
 
 
 class TestResumeLogin:
@@ -626,11 +753,77 @@ class TestResumeLogin:
             patch.object(c, "_complete_mfa"),
             patch.object(c, "_verify_token", return_value=False),
             patch.object(c, "_clear_auth_state") as mock_clear,
-            pytest.raises(garminconnect.GarminConnectConnectionError, match="token rejected by API tier after MFA"),
+            pytest.raises(
+                garminconnect.GarminConnectConnectionError,
+                match="token rejected by API tier after MFA",
+            ),
         ):
             c.resume_login({}, "123456")
 
         mock_clear.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("status", "hinted"), [("API Error 403", True), ("API Error 401", False)]
+    )
+    def test_client_resume_login_rejection_hint_only_on_403(
+        self, status: str, hinted: bool
+    ):
+        """A 403 can be Garmin blocking the client/network, not the token;
+        a 401 really is the token being refused, so it gets no such hint.
+        """
+        c = client_mod.Client(verify_login=True)
+        with (
+            patch.object(c, "_complete_mfa"),
+            patch.object(
+                c,
+                "connectapi",
+                side_effect=garminconnect.GarminConnectConnectionError(status),
+            ),
+            patch.object(c, "_clear_auth_state"),
+            pytest.raises(
+                garminconnect.GarminConnectConnectionError,
+                match="token rejected by API tier after MFA",
+            ) as exc_info,
+        ):
+            c.resume_login({}, "123456")
+        assert ("blocking this client or network" in str(exc_info.value)) is hinted
+
+    @pytest.mark.parametrize(
+        ("status", "hinted"),
+        [
+            ("API Error 403", True),
+            ("API Error 401", False),
+            # The status comes from the prefix, not from numbers in the detail.
+            ("API Error 401 - see help article 403", False),
+        ],
+    )
+    def test_verify_token_warning_hints_block_only_on_403(
+        self, caplog, status: str, hinted: bool
+    ):
+        c = client_mod.Client(verify_login=True)
+        with (
+            patch.object(
+                c,
+                "connectapi",
+                side_effect=garminconnect.GarminConnectConnectionError(status),
+            ),
+            caplog.at_level(logging.WARNING, logger="garminconnect"),
+        ):
+            assert c._verify_token() is False
+        assert ("blocking this client or network" in caplog.text) is hinted
+
+    def test_verify_token_ignores_status_numbers_in_error_detail(self):
+        """A 5xx whose detail mentions 403 is inconclusive, not a rejection."""
+        c = client_mod.Client(verify_login=True)
+        with patch.object(
+            c,
+            "connectapi",
+            side_effect=garminconnect.GarminConnectConnectionError(
+                "API Error 500 - upstream returned 403"
+            ),
+        ):
+            assert c._verify_token() is True
+        assert c._last_rejection_status is None
 
     def test_client_resume_login_skips_verify_when_verify_login_disabled(self):
         c = client_mod.Client(verify_login=False)
@@ -643,6 +836,216 @@ class TestResumeLogin:
         mock_complete.assert_called_once_with("123456")
         mock_verify.assert_not_called()
 
+    def test_client_resume_login_keeps_session_on_wrong_code_for_retry(self):
+        """A failed verification code must not wipe the pending MFA session —
+        otherwise a retry with the correct code can never succeed (issue 416).
+        """
+        c = client_mod.Client(verify_login=False)
+        c._mfa_pending = True
+        c._mfa_session = object()
+        c._mfa_flow = "portal"
+        c._mfa_method = "email"
+
+        with (
+            patch.object(
+                c,
+                "_complete_mfa",
+                side_effect=garminconnect.GarminConnectAuthenticationError("bad code"),
+            ),
+            pytest.raises(garminconnect.GarminConnectAuthenticationError),
+        ):
+            c.resume_login({}, "000000")
+
+        assert c._mfa_pending is True
+        assert c._mfa_session is not None
+        assert c._mfa_flow == "portal"
+        assert c._mfa_method == "email"
+
+        # Retry with the correct code on the same instance now succeeds.
+        with patch.object(c, "_complete_mfa") as mock_complete:
+            assert c.resume_login({}, "123456") == (None, None)
+        mock_complete.assert_called_once_with("123456")
+        assert c._mfa_pending is False
+
+    @pytest.mark.parametrize(
+        "impersonate", ["safari15_5", None], ids=["curl_cffi", "requests"]
+    )
+    def test_client_resume_login_rebuilds_pending_login_from_state(
+        self, impersonate: str | None
+    ):
+        """A new instance (e.g. in another process) finishes the login."""
+        state = _widget_mfa_state(impersonate)
+        c = client_mod.Client(verify_login=False)
+        seen: dict[str, Any] = {}
+
+        def fake_complete(code):
+            sess = c._mfa_session
+            seen["impersonate"] = getattr(sess, "impersonate", None)
+            seen["cookies"] = {
+                (k.name, k.value, k.domain, k.path)
+                for k in getattr(sess.cookies, "jar", sess.cookies)
+            }
+            seen["csrf_token"] = c._widget_csrf_token
+            seen["flow"] = c._mfa_flow
+            seen["login_params"] = c._mfa_login_params
+            seen["post_headers"] = c._mfa_post_headers
+
+        with patch.object(
+            c, "_complete_mfa", side_effect=fake_complete
+        ) as mock_complete:
+            assert c.resume_login(json.loads(json.dumps(state)), "123456") == (
+                None,
+                None,
+            )
+
+        mock_complete.assert_called_once_with("123456")
+        assert seen == {
+            "impersonate": impersonate,
+            "cookies": {("SESSIONID", "s1", "sso.garmin.com", "/sso")},
+            "csrf_token": "tok123",
+            "flow": "widget",
+            "login_params": {"id": "gauth-widget"},
+            "post_headers": {"Referer": "https://sso.garmin.com/sso/signin"},
+        }
+        assert c._mfa_pending is False
+        assert c._mfa_session is None
+
+    @pytest.mark.parametrize(
+        "make_session",
+        [lambda: client_mod.cffi_requests.Session(impersonate="chrome"), Session],
+        ids=["curl_cffi", "requests"],
+    )
+    def test_mfa_state_keeps_cookie_attributes(self, make_session: Any):
+        """Restored cookies keep their Secure flag, expiry and host-only scope."""
+        src = client_mod.Client(verify_login=False)
+        src._mfa_session = make_session()
+        src_jar = getattr(src._mfa_session.cookies, "jar", src._mfa_session.cookies)
+        host_only = create_cookie(
+            "__Host-sso", "h", domain="sso.garmin.com", path="/", secure=True
+        )
+        host_only.domain_specified = False
+        src_jar.set_cookie(host_only)
+        src_jar.set_cookie(
+            create_cookie(
+                "GARMIN-SSO",
+                "d",
+                domain=".garmin.com",
+                path="/",
+                expires=int(time.time()) + 3600,
+            )
+        )
+        src._mfa_flow = "widget"
+        src._mfa_login_params = {}
+        src._mfa_post_headers = {}
+        src._widget_csrf_token = "tok123"  # noqa: S105
+
+        dst = client_mod.Client(verify_login=False)
+        dst._restore_mfa_state(json.loads(json.dumps(src._mfa_client_state())))
+        dst_jar = getattr(dst._mfa_session.cookies, "jar", dst._mfa_session.cookies)
+
+        def attrs(jar):
+            return {
+                (
+                    c.name,
+                    c.value,
+                    c.domain,
+                    c.path,
+                    c.secure,
+                    c.expires,
+                    c.domain_specified,
+                )
+                for c in jar
+            }
+
+        assert attrs(dst_jar) == attrs(src_jar)
+
+    def test_client_resume_login_prefers_the_live_pending_session(self):
+        """The instance that started the login ignores the passed state."""
+        c = client_mod.Client(verify_login=False)
+        live = object()
+        c._mfa_pending = True
+        c._mfa_session = live
+        seen = []
+        with patch.object(
+            c, "_complete_mfa", side_effect=lambda _code: seen.append(c._mfa_session)
+        ):
+            c.resume_login({"flow": "portal", "impersonate": None}, "123456")
+        assert seen == [live]
+
+    @pytest.mark.parametrize(
+        "service_url",
+        [
+            None,
+            "https://connect.garmin.com/app",
+            "https://mobile.integration.garmin.com/gcm/ios",
+            "https://sso.garmin.com/sso/embed",
+        ],
+    )
+    def test_client_resume_login_accepts_garmin_service_urls(self, service_url):
+        """Every service URL the login flows set itself is accepted."""
+        state = _widget_mfa_state(None)
+        state["service_url"] = service_url
+        c = client_mod.Client(verify_login=False)
+        c._restore_mfa_state(state)
+        assert c._mfa_service_url == service_url
+        assert c._mfa_pending is True
+
+    def test_client_resume_login_rejects_state_from_the_other_region(self):
+        """A garmin.com state must not be sent to sso.garmin.cn, or vice versa."""
+        c = client_mod.Client(domain="garmin.cn", verify_login=False)
+        with (
+            patch.object(c, "_complete_mfa") as mock_complete,
+            pytest.raises(
+                garminconnect.GarminConnectAuthenticationError,
+                match="same is_cn setting",
+            ),
+        ):
+            c.resume_login(_widget_mfa_state(None), "123456")
+        mock_complete.assert_not_called()
+        assert c._mfa_pending is False
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            # Missing a field read after the others have been restored.
+            lambda s: s.pop("csrf_token"),
+            lambda s: s.update(flow=123),
+            lambda s: s["cookies"][0].update(domain=123),
+            # The service ticket must never be sent to a host from the state.
+            lambda s: s.update(service_url="https://attacker.example/steal"),
+            lambda s: s.update(service_url="https://connect.garmin.cn/app"),
+            lambda s: s.update(login_params={"service": 1}),
+            lambda s: s.update(post_headers=["Referer"]),
+            lambda s: s.update(csrf_token=None),
+        ],
+        ids=[
+            "missing-field",
+            "unknown-flow",
+            "bad-cookie",
+            "foreign-service-url",
+            "other-region-service-url",
+            "non-string-login-param",
+            "non-dict-post-headers",
+            "widget-without-csrf-token",
+        ],
+    )
+    def test_client_resume_login_rejects_invalid_state(self, change: Any):
+        """A bad state raises a clear error and leaves no partial login."""
+        state = _widget_mfa_state(None)
+        change(state)
+        c = client_mod.Client(verify_login=False)
+        with (
+            patch.object(c, "_complete_mfa") as mock_complete,
+            pytest.raises(
+                garminconnect.GarminConnectAuthenticationError,
+                match="start the login again",
+            ),
+        ):
+            c.resume_login(state, "123456")
+        mock_complete.assert_not_called()
+        assert c._mfa_pending is False
+        assert c._mfa_flow is None
+
     def test_garmin_resume_login_propagates_profile_load_failure(self):
         g = garminconnect.Garmin("user@example.com", "secret")
         with (
@@ -650,9 +1053,7 @@ class TestResumeLogin:
             patch.object(
                 g,
                 "_load_profile_and_settings",
-                side_effect=garminconnect.GarminConnectAuthenticationError(
-                    "bad token"
-                ),
+                side_effect=garminconnect.GarminConnectAuthenticationError("bad token"),
             ) as mock_load,
             pytest.raises(
                 garminconnect.GarminConnectAuthenticationError, match="bad token"
@@ -704,6 +1105,40 @@ class TestLoginMFA:
             status, _ = c.login("e@x.com", "pw", return_on_mfa=True)
 
         assert status == "needs_mfa"
+
+    @pytest.mark.parametrize(
+        ("make_session", "impersonate"),
+        [
+            (
+                lambda: client_mod.cffi_requests.Session(impersonate="safari15_5"),
+                "safari15_5",
+            ),
+            (Session, None),
+        ],
+        ids=["curl_cffi", "requests"],
+    )
+    def test_return_on_mfa_returns_json_serializable_state(
+        self, make_session: Any, impersonate: str | None
+    ):
+        """login() returns everything resume_login() needs, as plain JSON."""
+        c = client_mod.Client(verify_login=False)
+        sess = make_session()
+        sess.cookies.set("SESSIONID", "s1", domain="sso.garmin.com", path="/sso")
+
+        def mfa_strategy(_email, _password):
+            c._mfa_session = sess
+            c._mfa_login_params = {"id": "gauth-widget"}
+            c._mfa_post_headers = {"Referer": "https://sso.garmin.com/sso/signin"}
+            c._mfa_flow = "widget"
+            c._mfa_method = "email"
+            c._widget_csrf_token = "tok123"  # noqa: S105
+            raise client_mod._MFARequired()
+
+        with patch.object(c, "_widget_web_login", side_effect=mfa_strategy):
+            status, state = c.login("e@x.com", "pw", return_on_mfa=True)
+
+        assert status == "needs_mfa"
+        assert json.loads(json.dumps(state)) == _widget_mfa_state(impersonate)
 
     def test_mfa_without_prompt_raises(self):
         c = client_mod.Client(verify_login=False)
@@ -1006,11 +1441,21 @@ class TestSanitizedLoginErrors:
             "customerGuid": "guid-123",
             "serviceUrl": "https://internal-sso.garmin.com/secret",
         }
-        sess = type("Sess", (), {"post": lambda *a, **k: self._json_response(200, sensitive)})()
+        sess = type(
+            "Sess",
+            (),
+            {
+                "get": lambda *a, **k: self._json_response(200, {}),
+                "post": lambda *a, **k: self._json_response(200, sensitive),
+            },
+        )()
         c = client_mod.Client(verify_login=False)
-        with pytest.raises(
-            garminconnect.GarminConnectConnectionError, match="responseStatus=LOCKED"
-        ) as exc:
+        with (
+            patch("garminconnect.client.sso.time.sleep"),
+            pytest.raises(
+                garminconnect.GarminConnectConnectionError, match="responseStatus=LOCKED"
+            ) as exc,
+        ):
             c._do_mobile_login(sess, "e@x.com", "pw")
 
         msg = str(exc.value)
@@ -1100,19 +1545,20 @@ class TestLogout:
         g = garminconnect.Garmin("user@example.com", "secret")
         g.client._mfa_session = object()
         g.client._mfa_login_params = {"x": 1}
-        g.client._widget_last_resp = object()
+        g.client._widget_csrf_token = "tok"
 
         g.logout()
 
         assert g.client._mfa_session is None
         assert g.client._mfa_login_params is None
-        assert g.client._widget_last_resp is None
+        assert g.client._widget_csrf_token is None
 
     def test_logout_clears_garmin_wrapper_state(self):
         g = garminconnect.Garmin("user@example.com", "secret")
         g.display_name = "test-user"
         g.full_name = "Test User"
         g.unit_system = "metric"
+        g.profile_id = 12345
 
         g.logout()
 
@@ -1121,6 +1567,7 @@ class TestLogout:
         assert g.display_name is None
         assert g.full_name is None
         assert g.unit_system is None
+        assert g.profile_id is None
 
     def test_logout_skips_unlinking_inline_token_json(self):
         g = garminconnect.Garmin("user@example.com", "secret")
@@ -1493,6 +1940,19 @@ class TestParameterLimits:
         params = mock.call_args.kwargs["params"]
         assert params["activityType"] == "running"
 
+    def test_get_activities_passes_activitysubtype(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin, "connectapi", return_value=[]) as mock:
+            garmin.get_activities(
+                start=0,
+                limit=5,
+                activitytype="fitness_equipment",
+                activitysubtype="strength_training",
+            )
+
+            params = mock.call_args.kwargs["params"]
+            assert params["activityType"] == "fitness_equipment"
+            assert params["activitySubType"] == "strength_training"
+
     def test_get_activities_returns_empty_list_when_api_returns_none(
         self, garmin: garminconnect.Garmin
     ):
@@ -1589,6 +2049,43 @@ class TestResponseHandling:
         mock.assert_called_once()
         params = mock.call_args.kwargs["params"]
         assert params == {"showExclusiveBadge": "true"}
+
+    def test_get_activity_images_returns_images_from_metadata(
+        self, garmin: garminconnect.Garmin
+    ):
+        images = [
+            {"imageId": "img-1", "url": "https://s3.example/1.jpg", "photoDate": None},
+            {"imageId": "img-2", "url": "https://s3.example/2.jpg", "photoDate": None},
+        ]
+        payload = {"activityId": 12345, "metadataDTO": {"activityImages": images}}
+        with patch.object(garmin, "get_activity", return_value=payload) as mock:
+            result = garmin.get_activity_images(12345)
+
+        mock.assert_called_once_with("12345")
+        assert result == images
+
+    def test_get_activity_images_returns_empty_without_metadata(
+        self, garmin: garminconnect.Garmin
+    ):
+        with patch.object(garmin, "get_activity", return_value={"activityId": 1}):
+            assert garmin.get_activity_images(1) == []
+
+        with patch.object(garmin, "get_activity", return_value={"metadataDTO": None}):
+            assert garmin.get_activity_images(1) == []
+
+        with patch.object(
+            garmin,
+            "get_activity",
+            return_value={"metadataDTO": {"activityImages": None}},
+        ):
+            assert garmin.get_activity_images(1) == []
+
+    def test_get_activity_images_returns_empty_on_none_response(
+        self, garmin: garminconnect.Garmin
+    ):
+        # A successful response with a JSON null body parses to None.
+        with patch.object(garmin, "get_activity", return_value=None):
+            assert garmin.get_activity_images(1) == []
 
     def test_get_morning_training_readiness_picks_after_wakeup_entry(
         self, garmin: garminconnect.Garmin
@@ -1738,7 +2235,7 @@ class TestResponseHandling:
             [],
         ]
 
-        def fake_connectapi(url, params=None):
+        def fake_connectapi(url, params=None, headers=None):
             starts.append(params["start"])
             return pages.pop(0)
 
@@ -1747,7 +2244,33 @@ class TestResponseHandling:
 
         assert len(result) == 40
         assert mock.call_count == 3
-        assert starts == ["0", "30", "60"]
+        assert starts == ["1", "31", "61"]
+
+    def test_get_goals_rejects_zero_start(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="positive integer"):
+            garmin.get_goals(start=0)
+
+    @pytest.mark.parametrize(
+        "method",
+        [
+            "get_badge_challenges",
+            "get_available_badge_challenges",
+            "get_non_completed_badge_challenges",
+            "get_inprogress_virtual_challenges",
+        ],
+    )
+    def test_badge_challenges_reject_zero_start(
+        self, garmin: garminconnect.Garmin, method: str
+    ):
+        with pytest.raises(ValueError, match="positive integer"):
+            getattr(garmin, method)(0, 10)
+
+    def test_get_goals_sends_sec_fetch_site_header(self, garmin: garminconnect.Garmin):
+        """goal-service silently returns [] without this header (#431)."""
+        with patch.object(garmin, "connectapi", return_value=[]) as mock:
+            garmin.get_goals()
+
+        assert mock.call_args.kwargs["headers"] == {"Sec-Fetch-Site": "same-origin"}
 
 
 # ---------------------------------------------------------------------------
@@ -1763,6 +2286,93 @@ class _FakeResp:
 
     def json(self):
         return self._payload
+
+
+class TestGearActivityHttpResponses:
+    """Exercise gear retrieval through the native HTTP error handling path."""
+
+    gear_uuid = "c3f494a1-2d18-4df2-9b42-26efc8cc9158"
+
+    def _garmin_response(self, status, payload):
+        g = garminconnect.Garmin(retry_attempts=0)
+        g.client.di_token = "offline-test-token"
+        response = Response()
+        response.status_code = status
+        response._content = json.dumps(payload).encode()
+        return g, response
+
+    def test_gear_activities_404_returns_empty(self):
+        g, response = self._garmin_response(404, {"message": "Not Found"})
+        with patch.object(
+            g.client._api_session, "request", return_value=response
+        ) as req:
+            assert g.get_gear_activities(self.gear_uuid) == []
+        assert req.call_count == 1
+
+    def test_gear_stats_404_returns_empty(self):
+        g, response = self._garmin_response(404, {"message": "Not Found"})
+        with patch.object(g.client._api_session, "request", return_value=response):
+            assert g.get_gear_stats(self.gear_uuid) == {}
+
+    @pytest.mark.parametrize(
+        "activities",
+        [
+            [],
+            [{"activityId": 2, "distance": 0.0}, {"activityId": 1, "distance": 5000.0}],
+        ],
+    )
+    def test_gear_activities_success_preserves_data(self, activities):
+        g, response = self._garmin_response(200, activities)
+        with patch.object(
+            g.client._api_session, "request", return_value=response
+        ) as req:
+            assert g.get_gear_activities(self.gear_uuid, limit=10) == activities
+        assert req.call_count == 1
+        assert req.call_args.args == (
+            "GET",
+            f"https://connectapi.garmin.com/activitylist-service/activities/{self.gear_uuid}/gear",
+        )
+        assert req.call_args.kwargs["params"] == {"start": 0, "limit": 10}
+
+    @pytest.mark.parametrize("status", [403, 500])
+    def test_gear_activities_other_errors_preserve_response(self, status):
+        g, response = self._garmin_response(status, {"message": "Request failed"})
+        with (
+            patch.object(g.client._api_session, "request", return_value=response),
+            pytest.raises(garminconnect.GarminConnectConnectionError) as exc_info,
+        ):
+            g.get_gear_activities(self.gear_uuid)
+        assert type(exc_info.value) is garminconnect.GarminConnectConnectionError
+        assert exc_info.value.response is response
+
+    def test_connectapi_404_preserves_response_and_exception_type(self):
+        g, response = self._garmin_response(404, {"message": "Not Found"})
+        with (
+            patch.object(g.client._api_session, "request", return_value=response),
+            pytest.raises(garminconnect.GarminConnectNotFoundError) as exc_info,
+        ):
+            g.connectapi(f"/activitylist-service/activities/{self.gear_uuid}/gear")
+        assert exc_info.value.response is response
+
+    def test_import_activity_409_reports_duplicate(self, tmp_path):
+        fit = tmp_path / "ride.fit"
+        fit.write_bytes(b".FIT")
+        body = {
+            "detailedImportResult": {
+                "failures": [
+                    {"messages": [{"code": 202, "content": "Duplicate Activity."}]}
+                ]
+            }
+        }
+        g, response = self._garmin_response(409, body)
+        with (
+            patch.object(g.client._api_session, "request", return_value=response),
+            pytest.raises(
+                garminconnect.GarminConnectConnectionError,
+                match="already exists \\(duplicate\\): ride.fit",
+            ),
+        ):
+            g.import_activity(str(fit))
 
 
 class TestHttpErrorMapping:
@@ -1791,6 +2401,25 @@ class TestHttpErrorMapping:
         with pytest.raises(garminconnect.GarminConnectConnectionError) as exc_info:
             c._run_request("GET", "x")
         assert not isinstance(exc_info.value, garminconnect.GarminConnectNotFoundError)
+
+    def test_upload_failure_message_text_is_used(self, monkeypatch):
+        body = {
+            "detailedImportResult": {
+                "failures": [
+                    {"messages": [{"code": 202, "content": "Duplicate Activity."}]}
+                ]
+            }
+        }
+        c = self._client(monkeypatch, _FakeResp(409, body))
+        with pytest.raises(garminconnect.GarminConnectConnectionError) as exc_info:
+            c._run_request("POST", "upload-service/upload")
+        assert str(exc_info.value) == "API Error 409 - Duplicate Activity."
+
+    def test_non_text_error_detail_is_left_out(self, monkeypatch):
+        c = self._client(monkeypatch, _FakeResp(400, {"message": {"user": 123}}))
+        with pytest.raises(garminconnect.GarminConnectConnectionError) as exc_info:
+            c._run_request("GET", "x")
+        assert str(exc_info.value) == "API Error 400"
 
     def _garmin(self, monkeypatch, resp):
         g = garminconnect.Garmin()
@@ -1827,6 +2456,32 @@ class TestHttpErrorMapping:
         assert "db01.garmin.internal" not in str(exc_info.value)
         assert "API Error 500" in str(exc_info.value)
 
+    def test_debug_log_omits_raw_response_body(self, monkeypatch, caplog):
+        body = "<html><body>internal hostname: db01.garmin.internal</body></html>"
+        c = self._client(monkeypatch, _FakeResp(500, body))
+        with (
+            caplog.at_level(logging.DEBUG, logger="garminconnect"),
+            pytest.raises(garminconnect.GarminConnectConnectionError),
+        ):
+            c._run_request("GET", "x")
+        assert "db01.garmin.internal" not in caplog.text
+        assert "status=500" in caplog.text
+
+    def test_di_exchange_failure_log_omits_response_body(self, caplog):
+        """A failed DI exchange logs the status, never the token endpoint body."""
+        c = client_mod.Client(verify_login=False)
+        failed = type(
+            "Resp", (), {"ok": False, "status_code": 400, "text": "ST-CANARY detail"}
+        )()
+        with (
+            patch.object(c, "_http_post", return_value=failed),
+            caplog.at_level(logging.DEBUG, logger="garminconnect"),
+            pytest.raises(garminconnect.GarminConnectAuthenticationError),
+        ):
+            c._exchange_service_ticket("ST-CANARY")
+        assert "HTTP 400" in caplog.text
+        assert "ST-CANARY" not in caplog.text
+
     @pytest.mark.parametrize(
         "bad_path",
         [
@@ -1844,9 +2499,7 @@ class TestHttpErrorMapping:
             "foo\\..\\bar",
         ],
     )
-    def test_rejects_path_with_traversal_or_query(
-        self, monkeypatch, bad_path: str
-    ):
+    def test_rejects_path_with_traversal_or_query(self, monkeypatch, bad_path: str):
         c = self._client(monkeypatch, _FakeResp(200, {}))
         with pytest.raises(ValueError, match="Invalid API path"):
             c._run_request("GET", bad_path)
@@ -1870,9 +2523,7 @@ class TestHttpErrorMapping:
 
     def test_accepts_legitimate_path(self, monkeypatch):
         c = self._client(monkeypatch, _FakeResp(200, {"ok": True}))
-        resp = c._run_request(
-            "GET", "/userprofile-service/socialProfile"
-        )
+        resp = c._run_request("GET", "/userprofile-service/socialProfile")
         assert resp.status_code == 200
 
 
@@ -1907,9 +2558,7 @@ class Test401RetryFileRewind:
     def test_retry_rewinds_file_body(self, monkeypatch):
         read_sizes: list[int] = []
         responses = [_FakeResp(401, {}), _FakeResp(200, {"ok": True})]
-        c = self._client(
-            monkeypatch, self._consuming_request(responses, read_sizes)
-        )
+        c = self._client(monkeypatch, self._consuming_request(responses, read_sizes))
         payload = b"FITDATA" * 100
         resp = c._run_request(
             "POST", "upload", files={"file": ("a.fit", io.BytesIO(payload))}
@@ -1921,9 +2570,7 @@ class Test401RetryFileRewind:
     def test_retry_restores_initial_position_not_zero(self, monkeypatch):
         read_sizes: list[int] = []
         responses = [_FakeResp(401, {}), _FakeResp(200, {"ok": True})]
-        c = self._client(
-            monkeypatch, self._consuming_request(responses, read_sizes)
-        )
+        c = self._client(monkeypatch, self._consuming_request(responses, read_sizes))
         stream = io.BytesIO(b"HEADER" + b"BODY" * 10)
         stream.seek(6)  # caller intentionally skips a prefix
         c._run_request("POST", "upload", files={"file": ("a.fit", stream)})
@@ -1957,9 +2604,7 @@ class Test401RetryFileRewind:
 
         read_sizes: list[int] = []
         responses = [_FakeResp(401, {}), _FakeResp(200, {"ok": True})]
-        c = self._client(
-            monkeypatch, self._consuming_request(responses, read_sizes)
-        )
+        c = self._client(monkeypatch, self._consuming_request(responses, read_sizes))
         payload = b"FITDATA" * 100
         files = MappingProxyType({"file": ("a.fit", io.BytesIO(payload))})
         resp = c._run_request("POST", "upload", files=files)
@@ -2061,11 +2706,7 @@ class TestErrorMessageSanitization:
 
 
 def _b64url(data: dict[str, Any]) -> str:
-    return (
-        base64.urlsafe_b64encode(json.dumps(data).encode())
-        .decode()
-        .rstrip("=")
-    )
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
 
 
 def _make_jwt(header: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -2092,42 +2733,32 @@ class TestJwtHandling:
 
     def test_token_expires_soon_rejects_alg_none(self):
         c = client_mod.Client(verify_login=False)
-        token = _make_jwt(
-            {"alg": "none"}, {"exp": int(time.time()) + 60}
-        )
+        token = _make_jwt({"alg": "none"}, {"exp": int(time.time()) + 60})
         c.di_token = token
         assert c._token_expires_soon() is False
 
     def test_token_expires_soon_true_when_close_to_expiry(self):
         c = client_mod.Client(verify_login=False)
-        token = _make_jwt(
-            {"alg": "RS256"}, {"exp": int(time.time()) + 60}
-        )
+        token = _make_jwt({"alg": "RS256"}, {"exp": int(time.time()) + 60})
         c.di_token = token
         assert c._token_expires_soon() is True
 
     def test_token_expires_soon_false_when_far_from_expiry(self):
         c = client_mod.Client(verify_login=False)
-        token = _make_jwt(
-            {"alg": "RS256"}, {"exp": int(time.time()) + 3600}
-        )
+        token = _make_jwt({"alg": "RS256"}, {"exp": int(time.time()) + 3600})
         c.di_token = token
         assert c._token_expires_soon() is False
 
     def test_token_expires_soon_falls_back_to_jwt_web(self):
         c = client_mod.Client(verify_login=False)
-        token = _make_jwt(
-            {"alg": "RS256"}, {"exp": int(time.time()) + 60}
-        )
+        token = _make_jwt({"alg": "RS256"}, {"exp": int(time.time()) + 60})
         c.jwt_web = token
         assert c._token_expires_soon() is True
 
     def test_token_expires_soon_accepts_numeric_string_exp(self):
         # Some tokens encode 'exp' as a numeric string; it must still parse.
         c = client_mod.Client(verify_login=False)
-        token = _make_jwt(
-            {"alg": "RS256"}, {"exp": str(int(time.time()) + 60)}
-        )
+        token = _make_jwt({"alg": "RS256"}, {"exp": str(int(time.time()) + 60)})
         c.di_token = token
         assert c._token_expires_soon() is True
 
@@ -2135,18 +2766,18 @@ class TestJwtHandling:
         "exp",
         [
             "not-a-number",  # non-numeric string -> would raise ValueError
-            {"a": 1},        # non-empty dict     -> would raise TypeError
-            [1],             # non-empty list     -> would raise TypeError
-            None,            # missing / null
-            "",              # empty string
-            {},              # empty dict
-            [],              # empty list
-            True,            # bool is an int subclass; must be rejected
+            {"a": 1},  # non-empty dict     -> would raise TypeError
+            [1],  # non-empty list     -> would raise TypeError
+            None,  # missing / null
+            "",  # empty string
+            {},  # empty dict
+            [],  # empty list
+            True,  # bool is an int subclass; must be rejected
             False,
-            "inf",           # non-finite string  -> parses, must be rejected
+            "inf",  # non-finite string  -> parses, must be rejected
             "-inf",
             "nan",
-            10**400,         # huge JSON int      -> would raise OverflowError
+            10**400,  # huge JSON int      -> would raise OverflowError
         ],
     )
     def test_token_expires_soon_survives_malformed_exp(self, exp: Any):
@@ -2353,6 +2984,776 @@ class TestIdentifierValidation:
 
 
 # ---------------------------------------------------------------------------
+# get_next_scheduled_workout: earliest upcoming workout across this + next month
+# ---------------------------------------------------------------------------
+
+
+class TestGetNextScheduledWorkout:
+    def test_returns_earliest_upcoming_workout_in_current_month(
+        self, garmin: garminconnect.Garmin
+    ):
+        today = date.today()
+        today_str = today.isoformat()
+        later_str = (today + timedelta(days=10)).isoformat()
+
+        garmin.get_scheduled_workouts = lambda year, month: {  # type: ignore[method-assign]
+            "calendarItems": [
+                {"itemType": "weight", "date": today_str},
+                {"itemType": "workout", "date": later_str, "title": "Long run"},
+            ]
+        }
+
+        result = garmin.get_next_scheduled_workout()
+        assert result["title"] == "Long run"
+        assert result["date"] == later_str
+
+    def test_falls_back_to_next_month_when_current_month_has_none(
+        self, garmin: garminconnect.Garmin
+    ):
+        """Current month has no eligible workout, so the result must come
+        from next month, not just whichever month happens first in the
+        merged list (issue: both months previously used the same date,
+        so a stable sort could pick the wrong month's item for the wrong
+        reason and the test wouldn't catch it).
+        """
+        today = date.today()
+        next_month = today.month + 1 if today.month < 12 else 1
+        next_month_year = today.year if today.month < 12 else today.year + 1
+        next_month_date = date(next_month_year, next_month, 15).isoformat()
+
+        requested_months: list[tuple[int, int]] = []
+
+        def fake_get_scheduled_workouts(year, month):
+            requested_months.append((year, month))
+            if (year, month) == (today.year, today.month):
+                return {"calendarItems": []}
+            return {
+                "calendarItems": [
+                    {
+                        "itemType": "workout",
+                        "date": next_month_date,
+                        "title": "Next month's run",
+                    }
+                ]
+            }
+
+        garmin.get_scheduled_workouts = fake_get_scheduled_workouts  # type: ignore[method-assign]
+
+        result = garmin.get_next_scheduled_workout()
+
+        assert requested_months == [
+            (today.year, today.month),
+            (next_month_year, next_month),
+        ]
+        assert result["title"] == "Next month's run"
+        assert result["date"] == next_month_date
+
+    def test_ignores_past_workouts(self, garmin: garminconnect.Garmin):
+        today = date.today()
+        past_str = (today - timedelta(days=1)).isoformat()
+
+        garmin.get_scheduled_workouts = lambda year, month: {  # type: ignore[method-assign]
+            "calendarItems": [{"itemType": "workout", "date": past_str}]
+        }
+
+        assert garmin.get_next_scheduled_workout() == {}
+
+    def test_returns_empty_dict_when_nothing_scheduled(
+        self, garmin: garminconnect.Garmin
+    ):
+        garmin.get_scheduled_workouts = lambda year, month: {"calendarItems": []}  # type: ignore[method-assign]
+
+        assert garmin.get_next_scheduled_workout() == {}
+
+
+# ---------------------------------------------------------------------------
+# set_blood_pressure: pulse is optional, matching Garmin Connect's own UI (#426)
+# ---------------------------------------------------------------------------
+
+
+class TestSetBloodPressure:
+    def test_includes_pulse_when_given(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin.client, "post") as mock_post:
+            mock_post.return_value.json.return_value = {"success": True}
+            garmin.set_blood_pressure(120, 80, pulse=65)
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["systolic"] == 120
+        assert payload["diastolic"] == 80
+        assert payload["pulse"] == 65
+
+    def test_omits_pulse_when_not_given(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin.client, "post") as mock_post:
+            mock_post.return_value.json.return_value = {"success": True}
+            result = garmin.set_blood_pressure(120, 80)
+
+        assert result == {"success": True}
+        payload = mock_post.call_args.kwargs["json"]
+        assert "pulse" not in payload
+
+    def test_rejects_out_of_range_pulse(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="pulse"):
+            garmin.set_blood_pressure(120, 80, pulse=300)
+
+
+# ---------------------------------------------------------------------------
+# ID validation: never truncate (int(1.9) == 1 would target another resource)
+# ---------------------------------------------------------------------------
+
+
+class TestCoercePositiveId:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(123, 123), ("123", 123), (" 123 ", 123), (123.0, 123)],
+    )
+    def test_accepts_integral_values(self, value: Any, expected: int):
+        assert garminconnect._coerce_positive_id(value, "x") == expected
+
+    @pytest.mark.parametrize(
+        "value", [1.9, "1.9", "abc", "", None, True, [1], 0, -5, "0", 0.0]
+    )
+    def test_rejects_non_integral_or_non_positive(self, value: Any):
+        with pytest.raises(ValueError, match="x must be"):
+            garminconnect._coerce_positive_id(value, "x")
+
+    def test_delete_activity_rejects_fractional_id_without_request(
+        self, garmin: garminconnect.Garmin
+    ):
+        with (
+            patch.object(garmin, "client") as client,
+            pytest.raises(ValueError, match="whole number"),
+        ):
+            garmin.delete_activity(1.9)  # type: ignore[arg-type]
+        client.request.assert_not_called()
+
+    def test_delete_jetlag_trip_rejects_fractional_id_without_request(
+        self, garmin: garminconnect.Garmin
+    ):
+        with (
+            patch.object(garmin, "client") as client,
+            pytest.raises(ValueError, match="whole number"),
+        ):
+            garmin.delete_jetlag_trip(1.9)  # type: ignore[arg-type]
+        client.delete.assert_not_called()
+
+    @pytest.mark.parametrize("workout_id", [42, "42", 42.0])
+    def test_get_workout_by_id_still_accepts_existing_id_forms(
+        self, garmin: garminconnect.Garmin, workout_id: Any
+    ):
+        with patch.object(garmin, "connectapi", return_value={}) as api:
+            garmin.get_workout_by_id(workout_id)
+        assert api.call_args[0][0].endswith("/workout/42")
+
+
+# ---------------------------------------------------------------------------
+# create_gear: matches the payload captured from Garmin Connect's "Add Gear"
+# ---------------------------------------------------------------------------
+
+
+class TestCreateGear:
+    def test_builds_payload_matching_captured_request(
+        self, garmin: garminconnect.Garmin
+    ):
+        with patch.object(garmin.client, "post") as mock_post:
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                usage_type="DISTANCE",
+                max_usage_distance_km=650,
+                notes="My notes",
+                activity_type_keys=["running"],
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload == {
+            "uuid": None,
+            "gearType": "SHOES",
+            "brand": "Anta",
+            "model": "A-Flash",
+            "name": "Test",
+            "firstUseDate": "2026-09-06",
+            "maxUsageDate": None,
+            "maxUsageDistanceMeters": 650000,
+            "maxUsageDurationSeconds": 0,
+            "usageType": "DISTANCE",
+            "notes": "My notes",
+            "associatedActivityTypes": [
+                {
+                    "activityTypeKey": "running",
+                    "defaultGear": True,
+                    "preferredGear": False,
+                }
+            ],
+        }
+        url = mock_post.call_args[0][1]
+        assert url.endswith("/gear-service/gear/v2")
+
+    def test_normalizes_lowercase_gear_and_usage_type(
+        self, garmin: garminconnect.Garmin
+    ):
+        with patch.object(garmin.client, "post") as mock_post:
+            garmin.create_gear(
+                gear_type="shoes",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                usage_type="distance",
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["gearType"] == "SHOES"
+        assert payload["usageType"] == "DISTANCE"
+
+    def test_does_not_uppercase_activity_type_key(self, garmin: garminconnect.Garmin):
+        """activityTypeKey is lowercase in the confirmed payload — unlike
+        set_gear_default()'s uppercase activityType convention.
+        """
+        with patch.object(garmin.client, "post") as mock_post:
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                activity_type_keys=["running"],
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["associatedActivityTypes"][0]["activityTypeKey"] == "running"
+
+    def test_rejects_invalid_first_use_date(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="YYYY-MM-DD"):
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="not-a-date",
+            )
+
+    def test_rejects_empty_brand(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="brand"):
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+            )
+
+    def test_omits_activity_types_by_default(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin.client, "post") as mock_post:
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["associatedActivityTypes"] == []
+        assert payload["maxUsageDistanceMeters"] == 0
+        assert payload["maxUsageDurationSeconds"] == 0
+
+    def test_rejects_non_finite_max_usage_distance(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="finite"):
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                max_usage_distance_km=float("inf"),
+            )
+
+    def test_rejects_non_finite_max_usage_duration(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="finite"):
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                max_usage_duration_min=float("nan"),
+            )
+
+    def test_rejects_sub_meter_max_usage_distance(self, garmin: garminconnect.Garmin):
+        """A positive value that rounds to 0 meters would silently collide
+        with the 'no threshold' sentinel instead of applying a threshold.
+        """
+        with pytest.raises(ValueError, match="max_usage_distance_km"):
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                max_usage_distance_km=0.0001,
+            )
+
+    def test_rejects_sub_second_max_usage_duration(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="max_usage_duration_min"):
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                max_usage_duration_min=0.001,
+            )
+
+    def test_rejects_string_activity_type_keys(self, garmin: garminconnect.Garmin):
+        """A bare string is iterable — without a container-type check this
+        would silently create one bogus association per character.
+        """
+        with pytest.raises(ValueError, match="activity_type_keys"):
+            garmin.create_gear(
+                gear_type="SHOES",
+                brand="Anta",
+                model="A-Flash",
+                name="Test",
+                first_use_date="2026-09-06",
+                activity_type_keys="running",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Menstrual cycle writes / supporting reads
+# ---------------------------------------------------------------------------
+
+MENSTRUAL_TS = "2026-09-16T12:00:00.000"
+
+
+class TestMenstrualCycle:
+    def test_daily_log_posts_cleaned_snapshot(self, garmin: garminconnect.Garmin):
+        garmin.profile_id = 99
+        with (
+            patch.object(
+                garmin.client,
+                "post",
+                return_value={"calendarDate": "2026-09-01"},
+            ) as mock_post,
+            patch(
+                "garminconnect.api.womens_health._fmt_ts_utc", return_value=MENSTRUAL_TS
+            ),
+        ):
+            garmin.update_menstrual_daily_log(
+                "2026-09-01",
+                symptoms=["cramps", "FATIGUE"],
+                moods=["FINE"],
+                flow="medium",
+                discharge=["CREAMY"],
+                sex_drive="low",
+                sexual_activity="protected",
+                notes="hello",
+                ovulation_day=True,
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload == {
+            "calendarDate": "2026-09-01",
+            "symptoms": ["CRAMPS", "FATIGUE"],
+            "moods": ["FINE"],
+            "flow": "MEDIUM",
+            "discharge": ["CREAMY"],
+            "sexDrive": "LOW",
+            "sexualActivity": "PROTECTED",
+            "notes": "hello",
+            "ovulationDay": True,
+            "reportTimestamp": MENSTRUAL_TS,
+            "userProfilePk": 99,
+        }
+        url = mock_post.call_args[0][1]
+        assert url.endswith(
+            "/periodichealth-service/menstrualcycle/dailylog/2026-09-01"
+        )
+        assert mock_post.call_args.kwargs["api"] is True
+
+    def test_daily_log_omits_empty_lists_and_keeps_empty_notes(
+        self, garmin: garminconnect.Garmin
+    ):
+        with (
+            patch.object(garmin.client, "post", return_value={}) as mock_post,
+            patch(
+                "garminconnect.api.womens_health._fmt_ts_utc", return_value=MENSTRUAL_TS
+            ),
+        ):
+            garmin.update_menstrual_daily_log(
+                "2026-09-01",
+                symptoms=[],
+                moods=[],
+                discharge=[],
+                notes="",
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert "symptoms" not in payload
+        assert "moods" not in payload
+        assert "discharge" not in payload
+        assert "flow" not in payload
+        assert payload["notes"] == ""
+        assert payload["ovulationDay"] is False
+        assert "userProfilePk" not in payload
+
+    def test_daily_log_rejects_call_with_no_fields(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="at least one daily-log field"):
+            garmin.update_menstrual_daily_log("2026-09-01")
+
+    def test_daily_log_rejects_unknown_flow(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="flow must be one of"):
+            garmin.update_menstrual_daily_log("2026-09-01", flow="SPOTTING")
+
+    def test_daily_log_rejects_no_discharge_with_other_values(
+        self, garmin: garminconnect.Garmin
+    ):
+        with pytest.raises(ValueError, match="NO_DISCHARGE"):
+            garmin.update_menstrual_daily_log(
+                "2026-09-01", discharge=["NO_DISCHARGE", "CREAMY"]
+            )
+
+    def test_daily_log_rejects_pregnancy_symptom(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="symptoms\\[0\\]"):
+            garmin.update_menstrual_daily_log("2026-09-01", symptoms=["HEARTBURN"])
+
+    def test_calendar_posts_cycle_dates_lists(self, garmin: garminconnect.Garmin):
+        garmin.profile_id = 99
+        with (
+            patch.object(garmin.client, "post", return_value={}) as mock_post,
+            patch(
+                "garminconnect.api.womens_health._fmt_ts_utc", return_value=MENSTRUAL_TS
+            ),
+        ):
+            garmin.update_menstrual_calendar(
+                "2026-09-01",
+                "2026-09-10",
+                [["2026-09-01", "2026-09-02"], ["2026-09-08"]],
+                today_calendar_date="2026-09-16",
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload == {
+            "userProfilePk": 99,
+            "todayCalendarDate": "2026-09-16",
+            "startDate": "2026-09-01",
+            "endDate": "2026-09-10",
+            "reportTimestamp": MENSTRUAL_TS,
+            "cycleDatesLists": [
+                ["2026-09-01", "2026-09-02"],
+                ["2026-09-08"],
+            ],
+            "futureEditsByFE": True,
+        }
+        url = mock_post.call_args[0][1]
+        assert url.endswith("/periodichealth-service/menstrualcycle/calendarupdates")
+        assert "arrayOfCycles" not in payload
+
+    def test_calendar_rejects_nonconsecutive_group(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="consecutive"):
+            garmin.update_menstrual_calendar(
+                "2026-09-01",
+                "2026-09-10",
+                [["2026-09-01", "2026-09-03"]],
+            )
+
+    def test_calendar_rejects_dates_outside_range(self, garmin: garminconnect.Garmin):
+        with pytest.raises(ValueError, match="within startdate and enddate"):
+            garmin.update_menstrual_calendar(
+                "2026-09-01",
+                "2026-09-05",
+                [["2026-09-08"]],
+            )
+
+    def test_init_cycle_setup_posts_frontend_shape(self, garmin: garminconnect.Garmin):
+        garmin.profile_id = 99
+        with (
+            patch.object(garmin.client, "post", return_value={}) as mock_post,
+            patch(
+                "garminconnect.api.womens_health._fmt_ts_utc", return_value=MENSTRUAL_TS
+            ),
+        ):
+            garmin.init_menstrual_cycle_setup("2026-08-01", 5, 28)
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload == {
+            "userProfilePk": 99,
+            "periodStartDate": "2026-08-01",
+            "periodLength": 5,
+            "cycleLength": 28,
+            "reportTimestamp": MENSTRUAL_TS,
+        }
+        url = mock_post.call_args[0][1]
+        assert url.endswith("/periodichealth-service/menstrualcycle/initCycleSetup")
+
+    def test_confirm_period_start_posts_to_period_date(
+        self, garmin: garminconnect.Garmin
+    ):
+        with (
+            patch.object(garmin.client, "post", return_value={}) as mock_post,
+            patch(
+                "garminconnect.api.womens_health._fmt_ts_utc", return_value=MENSTRUAL_TS
+            ),
+        ):
+            garmin.confirm_menstrual_period_start(
+                "2026-09-08",
+                4,
+                28,
+                predicted_cycle=True,
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["periodStartDate"] == "2026-09-08"
+        assert payload["predictedCycle"] is True
+        assert payload["hasSpecifiedPeriodLength"] is True
+        assert payload["hasSpecifiedCycleLength"] is True
+        url = mock_post.call_args[0][1]
+        assert url.endswith("/periodichealth-service/menstrualcycle/2026-09-08")
+
+    def test_update_settings_merges_with_current_profile(
+        self, garmin: garminconnect.Garmin
+    ):
+        current = {
+            "id": 99,
+            "userMenstrualCycleSettings": {
+                "menstrualCycleType": "REGULAR",
+                "flowTracking": True,
+                "physicalSymptomsTracking": True,
+            },
+        }
+        with (
+            patch.object(garmin, "get_user_profile", return_value=current),
+            patch.object(garmin.client, "put", return_value={}) as mock_put,
+        ):
+            garmin.update_menstrual_settings({"flowTracking": False})
+
+        assert mock_put.call_args.kwargs["json"] == {
+            "id": 99,
+            "userMenstrualCycleSettings": {
+                "menstrualCycleType": "REGULAR",
+                "flowTracking": False,
+                "physicalSymptomsTracking": True,
+            },
+        }
+        url = mock_put.call_args[0][1]
+        assert url.endswith("/userprofile-service/userprofile/user-settings")
+        assert mock_put.call_args.kwargs["api"] is True
+
+    def test_update_settings_keeps_explicit_user_settings_id(
+        self, garmin: garminconnect.Garmin
+    ):
+        current = {
+            "id": 11,
+            "userMenstrualCycleSettings": {"flowTracking": True},
+        }
+        with (
+            patch.object(garmin, "get_user_profile", return_value=current),
+            patch.object(garmin.client, "put", return_value={}) as mock_put,
+        ):
+            garmin.update_menstrual_settings(
+                {"moodTracking": True}, user_settings_id=99
+            )
+
+        payload = mock_put.call_args.kwargs["json"]
+        assert payload["id"] == 99
+        assert payload["userMenstrualCycleSettings"] == {
+            "flowTracking": True,
+            "moodTracking": True,
+        }
+
+    def test_last_confirmed_and_summary_urls(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin, "connectapi", return_value={}) as mock:
+            garmin.get_menstrual_last_confirmed("2026-09-16")
+        assert mock.call_args[0][0].endswith(
+            "/periodichealth-service/menstrualcycle/lastconfirmed/2026-09-16"
+        )
+        with patch.object(garmin, "connectapi", return_value={}) as mock:
+            garmin.get_menstrual_cycle_summary("2026-09-16")
+        assert mock.call_args[0][0].endswith(
+            "/periodichealth-service/menstrualcycle/summary/2026-09-16"
+        )
+
+    def test_reports_rejects_unsupported_cycle_count(
+        self, garmin: garminconnect.Garmin
+    ):
+        with pytest.raises(ValueError, match="number_of_cycles"):
+            garmin.get_menstrual_reports("2026-09-16", 2)
+
+    def test_reports_builds_query(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin, "connectapi", return_value={}) as mock:
+            garmin.get_menstrual_reports(
+                "2026-09-16",
+                6,
+                next_report=True,
+                today_calendar_date="2026-09-16",
+            )
+        url = mock.call_args[0][0]
+        assert url.endswith(
+            "/periodichealth-service/reports/menstrualcycle/6/2026-09-16"
+        )
+        assert mock.call_args.kwargs["params"] == {
+            "next": "true",
+            "reportType": "CYCLE",
+            "todayCalendarDate": "2026-09-16",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Jet Lag Adviser trips
+# ---------------------------------------------------------------------------
+
+
+def _jetlag_flight(**overrides: Any) -> dict[str, Any]:
+    return {
+        "originLocation": "Portland, OR, United States",
+        "originTimezone": "-07:00",
+        "originTimestamp": "2026-10-04T15:20:00.00",
+        "destinationLocation": "Melbourne, VIC 3004, Australia",
+        "destinationTimezone": "+11:00",
+        "destinationTimestamp": "2026-10-06T06:45:00.00",
+    } | overrides
+
+
+class TestJetLagTrips:
+    """Jet Lag Adviser trips live under /jetlag-service/jetlag/trip."""
+
+    def test_get_trips_requests_all(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin, "connectapi", return_value=[]) as mock:
+            assert garmin.get_jetlag_trips() == []
+        mock.assert_called_once_with("/jetlag-service/jetlag/trip/all")
+
+    def test_add_posts_trip_with_user_id(self, garmin: garminconnect.Garmin):
+        garmin.profile_id = 99
+        flight = _jetlag_flight()
+        with patch.object(garmin, "client") as client:
+            client.post.return_value = {"tripId": 7}
+            result = garmin.add_jetlag_trip("2026-10-04", "2026-10-09", [flight])
+
+        args, kwargs = client.post.call_args
+        assert args == ("connectapi", "/jetlag-service/jetlag/trip")
+        assert kwargs["api"] is True
+        assert kwargs["json"] == {
+            "startDate": "2026-10-04",
+            "endDate": "2026-10-09",
+            "flights": [flight],
+            "userId": 99,
+        }
+        assert result == {"tripId": 7}
+
+    @pytest.mark.parametrize("offset", ["-12:00", "+05:45", "+14:00"])
+    def test_add_accepts_real_offsets(self, garmin: garminconnect.Garmin, offset: str):
+        flight = _jetlag_flight(destinationTimezone=offset)
+        with patch.object(garmin, "client") as client:
+            garmin.add_jetlag_trip("2026-10-04", "2026-10-09", [flight])
+        assert client.post.call_args.kwargs["json"]["flights"] == [flight]
+
+    def test_add_omits_user_id_without_profile(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin, "client") as client:
+            garmin.add_jetlag_trip("2026-10-04", "2026-10-09", [_jetlag_flight()])
+        assert "userId" not in client.post.call_args.kwargs["json"]
+
+    def test_update_puts_trip_id_on_trip_and_flights(
+        self, garmin: garminconnect.Garmin
+    ):
+        flight = _jetlag_flight(flightId=5, tripId=999)
+        with patch.object(garmin, "client") as client:
+            garmin.update_jetlag_trip("7", "2026-10-04", "2026-10-12", [flight])
+
+        args, kwargs = client.put.call_args
+        assert args == ("connectapi", "/jetlag-service/jetlag/trip")
+        assert kwargs["api"] is True
+        assert kwargs["json"]["tripId"] == 7
+        assert kwargs["json"]["endDate"] == "2026-10-12"
+        assert kwargs["json"]["flights"] == [flight | {"tripId": 7}]
+        # caller dict is not mutated
+        assert flight["tripId"] == 999
+
+    def test_delete_uses_trip_id_in_path(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin, "client") as client:
+            garmin.delete_jetlag_trip(7)
+        client.delete.assert_called_once_with(
+            "connectapi", "/jetlag-service/jetlag/trip/7", api=True
+        )
+
+    @pytest.mark.parametrize("method", ["update_jetlag_trip", "delete_jetlag_trip"])
+    def test_rejects_non_positive_trip_id(
+        self, garmin: garminconnect.Garmin, method: str
+    ):
+        args: tuple[Any, ...] = (0,)
+        if method == "update_jetlag_trip":
+            args += ("2026-10-04", "2026-10-09", [_jetlag_flight()])
+        with patch.object(garmin, "client") as client:
+            with pytest.raises(ValueError, match="positive integer"):
+                getattr(garmin, method)(*args)
+        assert not client.method_calls
+
+    def test_rejects_end_before_start(self, garmin: garminconnect.Garmin):
+        with patch.object(garmin, "client") as client:
+            with pytest.raises(ValueError, match="start date cannot be after"):
+                garmin.add_jetlag_trip("2026-10-09", "2026-10-04", [_jetlag_flight()])
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("flights", "message"),
+        [
+            ([], "non-empty list"),
+            (["flight"], r"flights\[0\] must be a dictionary"),
+            (
+                [_jetlag_flight(originLocation="")],
+                r"flights\[0\] is missing originLocation",
+            ),
+            (
+                [_jetlag_flight(destinationTimezone="Australia/Melbourne")],
+                "destinationTimezone must be a UTC offset",
+            ),
+            (
+                [_jetlag_flight(originTimezone="+99:99")],
+                "originTimezone must be a UTC offset",
+            ),
+            (
+                [_jetlag_flight(originTimezone="+15:00")],
+                "originTimezone must be a UTC offset",
+            ),
+            # Format-valid but outside the real -12:00..+14:00 range.
+            (
+                [_jetlag_flight(originTimezone="-13:00")],
+                "originTimezone must be a UTC offset",
+            ),
+            (
+                [_jetlag_flight(destinationTimezone="+14:30")],
+                "destinationTimezone must be a UTC offset",
+            ),
+            (
+                [_jetlag_flight(originTimestamp="2026-10-04 3:20pm")],
+                r"invalid flights\[0\]\.originTimestamp",
+            ),
+            (
+                [_jetlag_flight(destinationTimestamp="2026-10-06")],
+                r"invalid flights\[0\]\.destinationTimestamp: must hold a date",
+            ),
+            (
+                [_jetlag_flight(originTimestamp="2026-10-04T25:00:00")],
+                r"invalid flights\[0\]\.originTimestamp",
+            ),
+            (
+                [_jetlag_flight(originTimestamp="2026-10-04T15:20:00-07:00")],
+                "local time without an offset",
+            ),
+        ],
+    )
+    def test_rejects_invalid_flights(
+        self, garmin: garminconnect.Garmin, flights: list[Any], message: str
+    ):
+        with patch.object(garmin, "client") as client:
+            with pytest.raises(ValueError, match=message):
+                garmin.add_jetlag_trip("2026-10-04", "2026-10-09", flights)
+        client.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Activity upload filename handling
 # ---------------------------------------------------------------------------
 
@@ -2373,3 +3774,52 @@ class TestActivityUpload:
         assert filename == "activity.fit"
         assert not filename.startswith('"')
         assert not filename.endswith('"')
+
+
+# ---------------------------------------------------------------------------
+# Errors for old garth tokens and missing login
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyTokenErrors:
+    """Upgraders from garth-based versions get an actionable error."""
+
+    @pytest.mark.parametrize("filename", ["oauth1_token.json", "oauth2_token.json"])
+    def test_garth_tokenstore_without_credentials_explains(self, tmp_path, filename):
+        (tmp_path / filename).write_text("{}")
+        g = garminconnect.Garmin()
+        with pytest.raises(
+            garminconnect.GarminConnectAuthenticationError, match="garth-format"
+        ):
+            g.login(str(tmp_path))
+
+    def test_garth_tokenstore_with_credentials_logs_in(self, tmp_path):
+        (tmp_path / "oauth1_token.json").write_text("{}")
+        g = garminconnect.Garmin("user@example.com", "secret")
+        with (
+            patch.object(g.client, "login", return_value=(None, None)) as mock_login,
+            patch.object(g.client, "dump"),
+            patch.object(g, "_load_profile_and_settings"),
+        ):
+            g.login(str(tmp_path))
+        mock_login.assert_called_once()
+
+    def test_empty_tokenstore_keeps_generic_error(self, tmp_path):
+        g = garminconnect.Garmin()
+        with pytest.raises(
+            garminconnect.GarminConnectAuthenticationError,
+            match="Username and password",
+        ):
+            g.login(str(tmp_path))
+
+    def test_new_tokens_next_to_garth_tokens_are_not_legacy(self, tmp_path):
+        (tmp_path / "oauth1_token.json").write_text("{}")
+        (tmp_path / "garmin_tokens.json").write_text("{}")
+        assert not garminconnect._is_legacy_garth_tokenstore(str(tmp_path))
+
+    def test_api_call_without_login_says_to_login(self):
+        g = garminconnect.Garmin()
+        with pytest.raises(
+            garminconnect.GarminConnectAuthenticationError, match=r"login\(\) first"
+        ):
+            g.client.get_api_headers()

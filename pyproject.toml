@@ -1,6 +1,6 @@
 [project]
 name = "garminconnect"
-version = "0.3.11"
+version = "0.3.20"
 description = "Python 3 API wrapper for Garmin Connect"
 authors = [
     {name = "Ron Klinkien", email = "ron@cyberjunky.nl"},
@@ -9,6 +9,8 @@ dependencies = [
     "curl_cffi>=0.15.0",
     "requests>=2.33.0",
     "ua-generator>=1.0",
+    # zoneinfo has no system tz database on Windows
+    "tzdata; sys_platform == 'win32'",
 ]
 readme = "README.md"
 license = {text = "MIT"}
@@ -16,6 +18,7 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
@@ -54,6 +57,7 @@ warn_unused_ignores = true
 module = [
     "test_garmin",
     "test_garmin_unit",
+    "test_load_focus",
     "test_retry_decorator",
     "test_workout_constants",
     "test_strength_workout",
@@ -206,7 +210,6 @@ unfixable = []  # Allow all fixes, including unsafe ones
 "garminconnect/workout.py" = ["D401"]  # Pydantic models - docstring mood is fine
 "demo.py" = ["T20", "S101", "ERA", "RUF001", "PTH", "PERF401", "PERF203", "PLR0911", "D103"]  # Demo script - various user-facing patterns
 "example.py" = ["S110", "PLR0911", "T20", "PERF203"]  # Example script - simple error handling is intentional
-"test_strategy.py" = ["T20", "D103"]  # Interactive login-strategy diagnostic script
 "scripts/*" = ["T20", "D103"]  # Maintainer CLI utilities - printing is intentional
 "tests/test_token_permissions.py" = ["S105"]  # synthetic token literals in fixtures
 
