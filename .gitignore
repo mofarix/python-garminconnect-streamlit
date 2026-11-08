@@ -1,4 +1,9 @@
 # Custom
+vulnerability_reports/
+SECURITY_AUDIT_LOG.md
+your_data/
+tests/*.fit
+tests/cassettes/
 garminexports/
 garmin_export*/
 .output/
