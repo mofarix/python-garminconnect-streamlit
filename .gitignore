@@ -1,11 +1,17 @@
 # Custom
-vulnerability_reports/
-SECURITY_AUDIT_LOG.md
-your_data/
-tests/*.fit
-tests/cassettes/
+garminexports/
+garmin_export*/
+.output/
+.dashboard_cache.json
 pdm.lock
 .claude/
+
+# Credentials / Secrets — niemals einchecken
+.env
+.env.*
+*.token
+*.credentials
+secrets.json
 
 # Virtual environments
 .venv/
