@@ -1,0 +1,17 @@
+streamlit run meine-scripts/app.py
+
+git fetch origin # mofarix
+
+
+git fetch upstream
+git switch master
+git merge upstream/master
+git push origin master
+git switch meine-scripts
+git merge master
+git push origin meine-scripts
+
+
+
+
+

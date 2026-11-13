@@ -18,8 +18,8 @@ import tempfile
 from pathlib import Path
 
 import dashboard as dash
+import dashboard_view
 import pandas as pd
-import plotly.io as pio
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -327,63 +327,7 @@ elif page == "Cycling Dashboard":
         st.error(f"Fehler beim Laden der FIT-Daten: {e}")
         st.stop()
 
-    k = dash.kpi(df)
-
-    def _fmt(v, dec=1, suffix=""):
-        return f"{v:,.{dec}f}{suffix}" if pd.notna(v) else "—"
-
-    # KPIs
-    kpi_cols = st.columns(4)
-    kpi_data = [
-        ("Fahrten",        str(k["rides"]),              "gesamt",            None),
-        ("Distanz",        _fmt(k["km"], 0),              "km",                None),
-        ("Fahrzeit",       _fmt(k["hours"], 1),           "h",                 None),
-        ("Ø Tempo",        _fmt(k["avg_speed"]),          "km/h",              None),
-        ("Ø Herzfrequenz", _fmt(k["avg_hr"], 0),          "bpm",               None),
-        ("Höhenmeter",     f"{int(k['elevation']):,}",   "hm",
-         "Aus Trackpunkten berechnet: Median- und Savitzky-Golay-Glättung, dann Anstiege summiert "
-         "(Gerätewert total_ascent überschätzt durch GPS-Rauschen)."),
-        ("Pendel-Quote",   _fmt(k["commute_pct"], 0),    "% der Werktage",    None),
-        ("Wochen aktiv",   str(k["n_weeks"]),             "Wochen",            None),
-    ]
-    for i, (label, val, unit, help_text) in enumerate(kpi_data):
-        kpi_cols[i % 4].metric(label, f"{val} {unit}".strip(), help=help_text)
-
-    st.markdown("---")
-
-    # Volumen & Fitness
-    c1, c2 = st.columns(2)
-    with c1:
-        st.caption("Wöchentliches Volumen nach Fahrttyp")
-        st.plotly_chart(pio.from_json(dash.chart_volume(df)), width='stretch')
-    with c2:
-        st.caption("Fitness-Trend · HF & Tempo (gleitend)")
-        st.plotly_chart(pio.from_json(dash.chart_fitness(df)), width='stretch')
-
-    st.caption("Aktivitäts-Kalender · km pro Tag")
-    st.plotly_chart(pio.from_json(dash.chart_calendar(df)), width='stretch')
-
-    # Detailanalyse
-    c3, c4, c5 = st.columns(3)
-    with c3:
-        st.caption("HF-Zonen-Verteilung (geschätzt) pro Monat")
-        st.plotly_chart(pio.from_json(dash.chart_zones(df)), width='stretch')
-    with c4:
-        st.caption("Distanz-Verteilung nach Fahrttyp")
-        st.plotly_chart(pio.from_json(dash.chart_dist_hist(df)), width='stretch')
-    with c5:
-        st.caption("Pendel-Quote vs. Fahrten gesamt")
-        st.plotly_chart(pio.from_json(dash.chart_commute(df)), width='stretch')
-
-    # Letzte Fahrten
-    st.markdown("---")
-    st.subheader("Letzte Fahrten")
-    recent = df.sort_values("datum", ascending=False).head(15)[
-        ["datum", "kategorie", "km", "dauer_min", "avg_speed", "avg_bpm", "elevation"]
-    ].copy()
-    recent["datum"] = recent["datum"].dt.strftime("%d.%m.%Y")
-    recent.columns = ["Datum", "Typ", "km", "min", "km/h", "HF", "hm"]
-    st.dataframe(recent, width='stretch', hide_index=True)
+    dashboard_view.render(df)
 
 
 # ============================================================

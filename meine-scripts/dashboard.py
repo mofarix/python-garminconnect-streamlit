@@ -433,6 +433,312 @@ def chart_commute(df: pd.DataFrame) -> str:
     return pio.to_json(fig)
 
 # ---------------------------------------------------------------------------
+# Jahresübersicht (neues Dashboard-Layout, UI in dashboard_view.py)
+#
+# Höhenmeter kommen in allen Funktionen aus der Spalte "elevation", also aus
+# gpx_analysis.total_ascent_m (geglättete Trackpunkte) – nie aus dem
+# Gerätewert total_ascent der FIT-Session.
+# ---------------------------------------------------------------------------
+ACCENT = "#3FCF8E"
+WARN   = "#F2A541"
+N_CARD = "#181D24"
+N_EMPTY = "#262C35"
+N_LINE = "#3A424D"
+N_TEXT = "#E8EAED"
+N_MUTED = "#9AA3AE"
+MONATE = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
+METRICS = {  # Schlüssel → (Spalte, Faktor, Einheit)
+    "km":   ("km", 1.0, "km"),
+    "Hm":   ("elevation", 1.0, "m"),
+    "Zeit": ("dauer_min", 1 / 60, "h"),
+}
+
+
+def de(x, dec: int = 0) -> str:
+    """Zahl im deutschen Format (1.234,5); NaN → Gedankenstrich."""
+    if x is None or pd.isna(x):
+        return "—"
+    return f"{x:,.{dec}f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def _mix(fg: str, bg: str, a: float) -> str:
+    f = [int(fg[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(a * x + (1 - a) * y) for x, y in zip(f, b))
+
+
+def _nbase(height: int = 300) -> dict:
+    return dict(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=N_TEXT, family="'Inter',system-ui,sans-serif", size=12),
+        margin=dict(l=48, r=12, t=10, b=36), height=height, showlegend=False,
+        hoverlabel=dict(bgcolor="#0F1318", bordercolor=N_LINE, font=dict(color=N_TEXT)),
+        xaxis=dict(showgrid=False, linecolor=N_LINE, tickfont=dict(size=11, color=N_MUTED)),
+        yaxis=dict(gridcolor=N_EMPTY, zeroline=False, tickfont=dict(size=11, color=N_MUTED)),
+    )
+
+
+def years(df: pd.DataFrame) -> list[int]:
+    return sorted((int(y) for y in df["datum"].dt.year.unique()), reverse=True)
+
+
+def year_df(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    return df[df["datum"].dt.year == year]
+
+
+def _cutoff_doy(df: pd.DataFrame, year: int) -> int:
+    """Letzter Tag des Jahres mit Daten: im laufenden Jahr die jüngste Fahrt, sonst Jahresende."""
+    last = df["datum"].max()
+    return int(last.dayofyear) if year == last.year else 366
+
+
+def _totals(d: pd.DataFrame) -> dict:
+    v = d.dropna(subset=["km", "avg_speed"])
+    v = v[v["avg_speed"] > 0]
+    move_h = (v["km"] / v["avg_speed"]).sum()
+    return {
+        "rides": len(d),
+        "km": d["km"].sum(),
+        "elevation": d["elevation"].sum(),
+        "hours": d["dauer_min"].sum() / 60,
+        "speed": v["km"].sum() / move_h if move_h else float("nan"),
+    }
+
+
+def kpi_year(df: pd.DataFrame, year: int) -> list[dict]:
+    """Kennzahlen eines Jahres plus Veränderung zum Vorjahr am selben Stichtag (delta in %, None ohne Vorjahr)."""
+    cut = _cutoff_doy(df, year)
+    cur = _totals(year_df(df, year))
+    prev_d = year_df(df, year - 1)
+    prev_d = prev_d[prev_d["datum"].dt.dayofyear <= cut]
+    prev = _totals(prev_d) if len(prev_d) else None
+
+    def delta(key):
+        if not prev or not prev[key] or pd.isna(prev[key]) or pd.isna(cur[key]):
+            return None
+        return (cur[key] - prev[key]) / prev[key] * 100
+
+    return [
+        {"label": "Fahrten",    "value": de(cur["rides"]),      "unit": "",     "delta": delta("rides")},
+        {"label": "Distanz",    "value": de(cur["km"]),         "unit": "km",   "delta": delta("km")},
+        {"label": "Höhenmeter", "value": de(cur["elevation"]),  "unit": "m",    "delta": delta("elevation")},
+        {"label": "Fahrzeit",   "value": de(cur["hours"]),      "unit": "h",    "delta": delta("hours")},
+        {"label": "Ø Tempo",    "value": de(cur["speed"], 1),   "unit": "km/h", "delta": delta("speed")},
+    ]
+
+
+def activity_stats(df: pd.DataFrame, year: int) -> dict:
+    d = year_df(df, year)
+    weeks = sorted(d["week"].unique())
+    best = run = 0
+    prev = None
+    for w in weeks:
+        run = run + 1 if prev is not None and (w - prev).days == 7 else 1
+        best = max(best, run)
+        prev = w
+    return {"active_days": int(d["datum"].dt.normalize().nunique()), "streak_weeks": best}
+
+
+def chart_activity(df: pd.DataFrame, year: int) -> str:
+    """Heatmap im GitHub-Stil: Spalten = Wochen, Zeilen = Mo–So, Farbe = Tagesdistanz (Quartile der aktiven Tage)."""
+    d = year_df(df, year)
+    g = d.groupby(d["datum"].dt.normalize()).agg(
+        km=("km", "sum"), hm=("elevation", "sum"), n=("km", "count"))
+    days = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+    g = g.reindex(days)
+    last = df["datum"].max().normalize()
+    off = days[0].weekday()
+    ncol = (len(days) + off - 1) // 7 + 1
+
+    active = g["km"].dropna()
+    qs = np.quantile(active, [0.25, 0.5, 0.75]) if len(active) else np.zeros(3)
+    z = np.full((7, ncol), np.nan)
+    text = np.full((7, ncol), "", dtype=object)
+    for i, day in enumerate(days):
+        if day > last:
+            continue                      # Zukunft bleibt leer
+        col, row = (i + off) // 7, day.weekday()
+        km = g["km"].iloc[i]
+        if pd.isna(km):
+            z[row, col] = 0
+            text[row, col] = f"{day:%d.%m.%Y} · keine Fahrt"
+        else:
+            z[row, col] = 1 + int(np.searchsorted(qs, km, side="right"))
+            text[row, col] = (f"<b>{day:%d.%m.%Y}</b><br>{de(km, 1)} km · {de(g['hm'].iloc[i])} m"
+                              f" · {int(g['n'].iloc[i])} Fahrt(en)")
+
+    lv = [N_EMPTY] + [_mix(ACCENT, N_CARD, a) for a in (0.30, 0.52, 0.76, 1.0)]
+    scale = []
+    for k, color in enumerate(lv):
+        scale += [[k / 5, color], [(k + 1) / 5, color]]
+
+    fig = go.Figure(go.Heatmap(
+        z=z, text=text, x=list(range(ncol)), y=list(range(7)),
+        zmin=-0.5, zmax=4.5, colorscale=scale, showscale=False,
+        xgap=4, ygap=4, hoverongaps=False,
+        hovertemplate="%{text}<extra></extra>",
+    ))
+    month_cols = [(pd.Timestamp(year, m, 1).dayofyear - 1 + off) // 7 for m in range(1, 13)]
+    layout = _nbase(190)
+    layout["margin"] = dict(l=30, r=6, t=22, b=6)
+    layout["xaxis"] = dict(showgrid=False, zeroline=False, side="top", tickmode="array",
+                           tickvals=month_cols, ticktext=MONATE,
+                           tickfont=dict(size=11, color=N_MUTED), fixedrange=True)
+    layout["yaxis"] = dict(showgrid=False, zeroline=False, autorange="reversed", tickmode="array",
+                           tickvals=[0, 2, 4, 6], ticktext=["Mo", "Mi", "Fr", "So"],
+                           tickfont=dict(size=11, color=N_MUTED), fixedrange=True)
+    fig.update_layout(**layout)
+    return pio.to_json(fig)
+
+
+def activity_legend_colors() -> list[str]:
+    return [N_EMPTY] + [_mix(ACCENT, N_CARD, a) for a in (0.30, 0.52, 0.76, 1.0)]
+
+
+def year_forecast(df: pd.DataFrame, year: int) -> float | None:
+    """Hochrechnung der Jahresdistanz; nur im laufenden Jahr, sonst None."""
+    last = df["datum"].max()
+    if year != last.year:
+        return None
+    ndays = 366 if pd.Timestamp(year, 1, 1).is_leap_year else 365
+    return float(year_df(df, year)["km"].sum() / last.dayofyear * ndays)
+
+
+def chart_progress(df: pd.DataFrame, year: int, goal_km: float) -> str:
+    """Kumulierte Distanz des Jahres gegen Vorjahr und linearen Zielpfad."""
+    ndays = 366 if pd.Timestamp(year, 1, 1).is_leap_year else 365
+    upto = min(_cutoff_doy(df, year), ndays)
+
+    def cum(y, n):
+        d = year_df(df, y)
+        s = d.groupby(d["datum"].dt.dayofyear)["km"].sum()
+        return s.reindex(range(1, n + 1), fill_value=0).cumsum()
+
+    fig = go.Figure()
+    if goal_km:
+        fig.add_trace(go.Scatter(x=[1, ndays], y=[0, goal_km], mode="lines", name="Zielpfad",
+                                 line=dict(color=WARN, width=1.5, dash="dash"),
+                                 hovertemplate="Zielpfad: %{y:.0f} km<extra></extra>"))
+    if (df["datum"].dt.year == year - 1).any():
+        p = cum(year - 1, 365)
+        fig.add_trace(go.Scatter(x=p.index, y=p.round(0).values, mode="lines", name=str(year - 1),
+                                 line=dict(color="#6B7684", width=1.5),
+                                 hovertemplate=f"{year - 1}: %{{y:.0f}} km<extra></extra>"))
+    c = cum(year, upto)
+    fig.add_trace(go.Scatter(x=c.index, y=c.round(0).values, mode="lines", name=str(year),
+                             line=dict(color=ACCENT, width=2.5),
+                             hovertemplate=f"{year}: %{{y:.0f}} km<extra></extra>"))
+    fig.add_trace(go.Scatter(x=[c.index[-1]], y=[round(c.iloc[-1])], mode="markers", name="Stand",
+                             marker=dict(color=ACCENT, size=9, line=dict(color=N_CARD, width=2)),
+                             hoverinfo="skip"))
+    layout = _nbase(300)
+    layout["hovermode"] = "x unified"
+    layout["xaxis"].update(tickmode="array", range=[1, ndays], ticktext=MONATE,
+                           tickvals=[pd.Timestamp(year, m, 1).dayofyear for m in range(1, 13)])
+    layout["yaxis"].update(title_text="km", rangemode="tozero")
+    fig.update_layout(**layout)
+    return pio.to_json(fig)
+
+
+def chart_tour_hist(df: pd.DataFrame, year: int) -> str:
+    """Histogramm der Tourlänge in gleich breiten Klassen (10 km, ab 120 km Maximaldistanz 20 km)."""
+    km = year_df(df, year)["km"].dropna()
+    kmax = float(km.max()) if len(km) else 10.0
+    step = 10 if kmax <= 120 else 20
+    edges = np.arange(0, math.floor(kmax / step) * step + 2 * step, step)
+    counts, _ = np.histogram(km, bins=edges)
+    labels = [f"{int(a)}–{int(a + step)}" for a in edges[:-1]]
+    fig = go.Figure(go.Bar(
+        x=labels, y=counts, marker_color=ACCENT, marker_line_width=0,
+        text=[str(c) if c else "" for c in counts], textposition="outside",
+        textfont=dict(color=N_TEXT, size=11), cliponaxis=False,
+        hovertemplate="%{y} Fahrten mit %{x} km<extra></extra>",
+    ))
+    layout = _nbase(260)
+    layout["margin"] = dict(l=36, r=8, t=22, b=44)
+    layout["xaxis"].update(title_text="km", type="category")
+    layout["bargap"] = 0.18
+    fig.update_layout(**layout)
+    return pio.to_json(fig)
+
+
+def eddington(km: pd.Series) -> tuple[int, int]:
+    """Eddington-Zahl E (E Fahrten mit mindestens E km) und wie viele Fahrten für E+1 noch fehlen."""
+    v = np.sort(km.dropna().to_numpy())[::-1]
+    e = 0
+    while e < len(v) and v[e] >= e + 1:
+        e += 1
+    return e, e + 1 - int((v >= e + 1).sum())
+
+
+def week_volume(df: pd.DataFrame, year: int, metric: str = "km") -> pd.Series:
+    col, factor, _ = METRICS[metric]
+    d = year_df(df, year)
+    s = d.groupby("week")[col].sum() * factor
+    return s.reindex(pd.date_range(s.index.min(), s.index.max(), freq="W-MON"), fill_value=0)
+
+
+def chart_week_volume(df: pd.DataFrame, year: int, metric: str = "km") -> str:
+    """Wochenbalken für km, berechnete Höhenmeter oder Fahrzeit."""
+    unit = METRICS[metric][2]
+    s = week_volume(df, year, metric)
+    kw = [f"KW {int(w.isocalendar()[1])}" for w in s.index]
+    fig = go.Figure(go.Bar(
+        x=s.index, y=s.round(1).values, customdata=kw,
+        marker_color=ACCENT, marker_line_width=0,
+        hovertemplate="%{customdata}: %{y:.0f} " + unit + "<extra></extra>",
+    ))
+    layout = _nbase(260)
+    layout["xaxis"].update(tickformat="%b", dtick="M1")
+    layout["yaxis"].update(title_text=unit)
+    layout["bargap"] = 0.25
+    fig.update_layout(**layout)
+    return pio.to_json(fig)
+
+
+def records(df: pd.DataFrame, year: int) -> list[dict]:
+    d = year_df(df, year)
+    out = []
+
+    def add(label, sub_df, col, fmt):
+        s = sub_df.dropna(subset=[col])
+        if s.empty:
+            return
+        r = s.loc[s[col].idxmax()]
+        out.append({"label": label, "value": fmt(r[col]),
+                    "sub": f"{r['kategorie']} · {r['datum']:%d.%m.%Y}"})
+
+    add("Längste Fahrt", d, "km", lambda v: f"{de(v, 1)} km")
+    add("Meiste Höhenmeter", d, "elevation", lambda v: f"{de(v)} m")
+    add("Schnellster Schnitt (ab 20 km)", d[d["km"] >= LANG_MIN_KM], "avg_speed",
+        lambda v: f"{de(v, 1)} km/h")
+    wk = d.groupby("week")["km"].sum()
+    if len(wk):
+        w = wk.idxmax()
+        out.append({"label": "Stärkste Woche", "value": f"{de(wk.max())} km",
+                    "sub": f"KW {int(w.isocalendar()[1])} · ab {w:%d.%m.%Y}"})
+    return out
+
+
+def rides_table(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Alle Fahrten des Jahres, neueste zuerst, mit Rohwerten je FIT-Datei."""
+    d = year_df(df, year).sort_values("datum", ascending=False)
+    return pd.DataFrame({
+        "Datum":      d["datum"],
+        "Typ":        d["kategorie"],
+        "Distanz":    d["km"].round(1),
+        "Höhenmeter": d["elevation"],
+        "Fahrzeit":   d["dauer_min"].round(0),
+        "Ø km/h":     d["avg_speed"].round(1),
+        "Max km/h":   d["max_speed"].round(1),
+        "Ø Puls":     d["avg_bpm"],
+        "Max Puls":   d["max_bpm"],
+        "m / km":     (d["elevation"] / d["km"]).round(1),
+        "Load":       d["load"],
+    })
+
+
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     df = load(FIT_DIR, DATE_FROM)
     k  = kpi(df)
