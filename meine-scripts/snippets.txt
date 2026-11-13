@@ -2,6 +2,12 @@ streamlit run meine-scripts/app.py
 
 git fetch origin # mofarix
 
+# Pushen
+git add meine-scripts
+git commit -m "Dashboard-Änderungen"
+git push
+
+
 
 git fetch upstream
 git switch master
@@ -15,3 +21,4 @@ git push origin meine-scripts
 
 
 
+python

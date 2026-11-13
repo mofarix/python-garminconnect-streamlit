@@ -195,7 +195,7 @@ def render(df: pd.DataFrame) -> None:
     with c_year:
         year = st.segmented_control("Jahr", yrs, default=yrs[0], key="gv_year") or yrs[0]
     with c_goal:
-        goal = st.number_input("Jahresziel (km)", min_value=0, max_value=50000, value=5000,
+        goal = st.number_input("Jahresziel (km)", min_value=0, max_value=50000, value=1000,
                                step=500, key="gv_goal")
 
     tab_year, tab_types = st.tabs(["Jahresübersicht", "Pendeln & Fitness"])

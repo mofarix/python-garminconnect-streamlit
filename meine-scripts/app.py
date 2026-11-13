@@ -10,6 +10,7 @@ Seiten:
     streamlit run app.py
 """
 
+import logging
 import os
 import re
 import subprocess
@@ -33,6 +34,22 @@ from gpx_analysis import (
     g,
     rho,
 )
+
+
+class _IgnoreWinConnectionReset(logging.Filter):
+    """Unterdrückt das harmlose WinError 10054 Log des Windows-Proactor-Loops,
+    das entsteht, wenn der Browser die Verbindung schließt."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        return not isinstance(exc, ConnectionResetError)
+
+
+_asyncio_logger = logging.getLogger("asyncio")
+# Streamlit führt das Skript bei jedem Rerun neu aus (Klasse wird neu definiert),
+# daher per Klassenname prüfen, um Duplikate zu vermeiden.
+if not any(type(f).__name__ == "_IgnoreWinConnectionReset" for f in _asyncio_logger.filters):
+    _asyncio_logger.addFilter(_IgnoreWinConnectionReset())
 
 # ============================================================
 # CONFIG
