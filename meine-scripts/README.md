@@ -4,14 +4,16 @@ Streamlit-App zur Analyse von Garmin-Radfahrten — GPX-Analyse, FIT-Dashboard, 
 
 ## Schnellstart
 
+Alle Befehle im Repo-Root ausführen (dort liegen `garminexports/` und der Cache). Die Garmin-Anbindung (`garminconnect`) kommt aus dem Hauptpaket dieses Repos: `pip install -e .`
+
 ```bash
 pip install -r requirements.txt
 
 # Garmin-Daten herunterladen (einmalig / bei Bedarf)
-python pipeline.py
+python meine-scripts/pipeline.py
 
 # App starten
-streamlit run app.py
+streamlit run meine-scripts/app.py
 ```
 
 > **Windows:** `setup_env.ps1` legt eine virtuelle Umgebung an und installiert alle Pakete automatisch.
@@ -22,10 +24,10 @@ streamlit run app.py
 
 | Datei | Zweck |
 |---|---|
-| `app.py` | Streamlit-App – alle vier Seiten in einer UI |
-| `pipeline.py` | Garmin-Daten herunterladen (GPX + FIT) |
-| `dashboard.py` | Cycling-Dashboard-Logik aus FIT-Daten |
-| `gpx_analysis.py` | Analyse-Bibliothek (Kalman, Leistungsmodell, Karten) |
+| `meine-scripts/app.py` | Streamlit-App – alle vier Seiten in einer UI |
+| `meine-scripts/pipeline.py` | Garmin-Daten herunterladen (GPX + FIT) |
+| `meine-scripts/dashboard.py` | Cycling-Dashboard-Logik aus FIT-Daten |
+| `meine-scripts/gpx_analysis.py` | Analyse-Bibliothek (Kalman, Leistungsmodell, Karten) |
 
 ---
 

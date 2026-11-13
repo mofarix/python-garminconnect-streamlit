@@ -5,7 +5,7 @@ Liest FIT-Dateien aus garminexports/standard/fit/ und stellt Diagramme und KPIs 
 Wird von app.py als Modul genutzt; kann auch standalone KPIs ausgeben.
 
     pip install fitdecode pandas plotly numpy
-    python dashboard.py
+    python meine-scripts/dashboard.py
 """
 
 import math
